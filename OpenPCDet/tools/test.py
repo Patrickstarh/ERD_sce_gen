@@ -40,6 +40,8 @@ def parse_config():
     parser.add_argument('--ckpt_dir', type=str, default=None, help='specify a ckpt directory to be evaluated if needed')
     parser.add_argument('--save_to_file', action='store_true', default=False, help='')
     parser.add_argument('--infer_time', action='store_true', default=False, help='calculate inference latency')
+    parser.add_argument('--extract_perception_error', action='store_true', default=False,
+                        help='extract distance-dependent perception error distribution and fit quadratics')
 
     args = parser.parse_args()
 
@@ -64,7 +66,7 @@ def eval_single_ckpt(model, test_loader, args, eval_output_dir, logger, epoch_id
     # start evaluation
     eval_utils.eval_one_epoch(
         cfg, args, model, test_loader, epoch_id, logger, dist_test=dist_test,
-        result_dir=eval_output_dir
+        result_dir=eval_output_dir, extract_error=args.extract_perception_error
     )
 
 
@@ -122,7 +124,7 @@ def repeat_eval_ckpt(model, test_loader, args, eval_output_dir, logger, ckpt_dir
         cur_result_dir = eval_output_dir / ('epoch_%s' % cur_epoch_id) / cfg.DATA_CONFIG.DATA_SPLIT['test']
         tb_dict = eval_utils.eval_one_epoch(
             cfg, args, model, test_loader, cur_epoch_id, logger, dist_test=dist_test,
-            result_dir=cur_result_dir
+            result_dir=cur_result_dir, extract_error=args.extract_perception_error
         )
 
         if cfg.LOCAL_RANK == 0:
