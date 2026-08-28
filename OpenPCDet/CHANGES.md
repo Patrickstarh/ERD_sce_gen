@@ -190,3 +190,142 @@ python tools/test.py \
 ## 7. 已知依赖注意
 
 - `SharedArray` 在 `pcdet/utils/common_utils.py`（第 7 行）与 `pcdet/datasets/augmentor/database_sampler.py`（第 8 行）中被顶层无条件 `import`，是**全局硬依赖**（在 `requirements.txt` 中）。它是易装不上的 C 扩展；若安装失败会报 `ModuleNotFoundError: No module named 'SharedArray'`，此时需先 `pip install SharedArray`。本仓库当前**未**将其改为可选/懒加载。
+
+---
+
+# 第二部分：感知受限场景生成（sce_gen）
+
+> 本部分记录 `sce_gen/` 目录下 RL 场景生成环境的全部改动。它消费第一部分拟合出的感知噪声系数（Table III），
+> 在自车对周围车辆的观测上注入距离相关的高斯噪声，用 RL 训练对抗背景车制造「感知受限下的危险场景」。
+
+## 8. 文件清单
+
+| 文件 | 说明 |
+|---|---|
+| `sce_gen_ori.py` | 原始版本（保留作备份，未修改） |
+| `sce_gen.py` | 当前 CPU 版本（本文档多数改动在此落地） |
+| `sce_gen_gpu.py` | GPU 训练版本（`sce_gen.py` 的 argparse/device 包装） |
+| `submit_sce_gen.py` | 提交 DLP 集群的脚本 |
+| `analyze_results.ipynb` | 多 seed 结果合并分析 notebook |
+
+## 9. 车辆角色定义（关键）
+
+| id | 角色 | 控制方式 | 观测 |
+|---|---|---|---|
+| 0 | 自车（被测试系统） | IDM + MOBIL（可换道） | **带感知噪声**的周围车辆 |
+| 1 | 对抗背景车 | RL（纵向加速度 + 横向位移） | **真实状态**（无感知受限） |
+| 2,3,4 | 普通背景车 | IDM + MOBIL | 真实状态 |
+
+- 自车不再由 RL 控制，改为正常驾驶（IDM + MOBIL），是被测系统。
+- RL 智能体是**对抗背景车**（`adversary_id = 1`），负责制造危险场景。
+- 感知噪声只影响**自车看周围其他车**：自车对自身、以及背景车之间均为真实感知。
+- 对应代码：`Car.__init__` 新增 `is_adversary` 字段；`reset()` 里 `adversary_id`；`step()` 分支改为
+  `if car.is_adversary: ... elif car.is_ego: ... else: ...`。
+
+## 10. 感知噪声模型（距离依赖二次高斯）
+
+`perception_noise_coeffs`（第一部分拟合的 Table III 系数，硬编码在代码里）：
+
+```
+mu(d)    = a0 + a1*d + a2*d^2
+sigma(d) = b0 + b1*d + b2*d^2
+```
+
+四维误差 `(dx, dy, dvx, dvy)` 各有一组 `(mu, sigma)` 系数，与第一部分的 `perception_error_fit.json` 一致。
+
+- `_sample_perception_noise(d)`：按距离 `d` 采样噪声（`sigma` 裁剪为非负）。
+- `_update_perception()`：每步采样一次自车的带噪感知并缓存到 `last_perceived_states`，供决策与日志共用同一次噪声。
+- `_ego_perceived_cars()`：返回自车眼中的车辆列表（自车用真实自身，其余用带噪值），供自车 IDM/MOBL 决策使用（浅拷贝，不改真实状态）。
+- `enable_perception_noise = True` 开关，消融实验可设为 `False`。
+
+## 11. TTC 计算修复
+
+修复了 `step()` 中前向追尾 TTC 被 `pass` 跳过、只算后车追尾的 bug：
+
+```python
+if abs(agent.lane_pos - npc.lane_pos) < 2.2:
+    if dist_x > 0 and rel_v > 0:
+        # 自车追上前方慢车（前向追尾风险）
+        ttc = max((dist_x - agent.length), 0.0) / rel_v
+        min_ttc = min(min_ttc, ttc)
+    elif dist_x < 0 and rel_v < 0:
+        # 后车追上自车
+        ttc = max((abs(dist_x) - agent.length), 0.0) / abs(rel_v)
+        min_ttc = min(min_ttc, ttc)
+```
+
+与 `_simulate_future_ttc` 里的代理模型计算保持一致。
+
+## 12. 奖励函数（对齐论文公式）
+
+奖励 = 安全临界奖励 + 感知风险奖励：
+
+- **`r_safety`（论文公式 16）**：`TTC_LOW=1.0`、`TTC_HIGH=4.0`、`alpha_safety=5.0`、`beta_safety=1.0`
+  - `min_ttc < TTC_LOW` 或碰撞 → `beta_safety`
+  - `TTC_LOW <= min_ttc <= TTC_HIGH` → `alpha_safety * (TTC_HIGH - min_ttc) / (TTC_HIGH - TTC_LOW)`
+  - 其余 → 0（到最大步数则 truncated）
+- **`r_perception`（论文公式 17 / ERD）**：`_compute_perception_risk_reward`
+  - 用真实观测 + 带噪观测分别前向仿真 `n_steps` 步、Monte Carlo `n_samples` 次
+  - 风险度量 `1/TTC`，`Delta = E[R_obs] - E[R_true]`
+  - 奖励 = `alpha_perc * |Delta| + beta_perc * max(0, -Delta)`
+- 综合奖励 `reward = r_safety + r_perception`，裁剪到 `[-10, 100]`。
+- `info` 里新增 `r_safety`、`r_perception`、`perception_delta` 字段。
+
+## 13. HDF5 日志扩展
+
+每个 `episode_*` 组新增 `perception_data` 数据集，schema：
+
+- `trajectories` `(T, 5, 4)`：`[纵向位置 pos, 横向位置 lane_pos, 纵向速度 speed, 0]`，车顺序 `[ego, adversary, bg2, bg3, bg4]`
+- `perception_data` `(T, 5, 13)`：`[感知值(4) | 真实值(4) | 误差 delta(4) | 距离(1)]`
+  - 感知值：`[perceived_pos, perceived_lane_pos, perceived_speed, perceived_vy]`
+  - 真实值：`[true_pos, true_lane_pos, true_speed, true_vy]`
+  - 误差：`[dx, dy, dvx, dvy]`
+  - 距离：`dist_to_ego`
+- attrs：`collision`、`episode_length`、`episode_reward`。
+
+## 14. GPU 版本 `sce_gen_gpu.py`
+
+基于 `sce_gen.py` 新增：
+
+- argparse：`--gpu`（默认 0）、`--timesteps`（默认 200000）、`--seed`（默认 0）
+- `device = f'cuda:{args.gpu}'`
+- `record_path = f"./ppo_logs_gpu{args.gpu}_{timestamp}/"`
+- PPO 传入 `device=device, seed=args.seed, tensorboard_log=record_path + "tensorboard"`
+- `model.learn(total_timesteps=args.timesteps)`；`model.save(record_path + f"ppo_{args.timesteps // 1000}k")`
+
+> 注：`sce_gen.py`（CPU 版）仍保留旧的 tensorboard 路径
+> `"/root/autodl-tmp/OpenPCDet/ppo_logs/"`，如需本地 CPU 训练请自行改为本地路径。
+
+## 15. 提交脚本 `submit_sce_gen.py`
+
+参考 GoalFlow 的 DLP 提交方式（`from dlp_common import setup, submit, make_task_name, WORKSPACE_ROOT`）。
+
+- 多卡语义：**独立并行**（每张卡一个独立进程 + 独立 seed），非数据并行 DDP。SB3 PPO 无原生 DDP；瓶颈在 CPU 环境采样。
+- `PIP_PACKAGES = ["stable_baselines3", "gymnasium", "h5py"]`
+- `build_launcher` 生成 bash 脚本，`for i in seq 0 (N-1)` 启动
+  `python3 sce_gen_gpu.py --gpu $i --timesteps T --seed $((base+i))`，日志重定向到 `gpu_$i.log`。
+- 用法示例：
+
+  ```bash
+  python3 submit_sce_gen.py --resource-num 4 --timesteps 200000 --seed 42
+  ```
+
+## 16. 分析 notebook `analyze_results.ipynb`
+
+合并多个 seed 的危险场景库，输出统计、分布与可视化。头部 `DATA_DIR` / `H5_GLOB` 改路径即可复用。
+
+- 总体统计 + 分 run 对比（碰撞率 / 危险率 / 长度 / 奖励）
+- 分布：长度、TTC(log)、奖励直方图；分 run 柱状图 + boxplot
+- 感知误差分析：误差分布 + 误差随距离变化，叠加拟合 `mu(d)` / `mu±sigma(d)` 曲线
+- ERD-lite：感知 TTC vs 真实 TTC（对角线上方 = 低估危险）+ 风险低估直方图
+- 样例可视化：碰撞场景 / 最小 TTC 场景的纵向、横向位置时间曲线
+
+## 17. 训练结果（任务 `n260827-174817-scegen-ppo`）
+
+- 4 × H20 GPU，每卡 200k 步（合计 800k 步，独立 seed）
+- 结果目录：`/workspace/asw-shared/dlp/training_tasks/aoh6szh/n260827-174817-scegen-ppo/`
+- 每卡一个 `ppo_logs_gpu{0..3}_*/vae-ppo_vehicle_trajectories_*.h5`，每个约 2500 episode
+- 合并统计（4 seed 共 9988 场景）：碰撞率 3.06%、危险（TTC<4s）11.90%、严重（TTC<1s）4.55%
+- 感知风险低估：真实危险时刻中 54.17% 自车低估了危险（感知 TTC > 真实 TTC）
+- 已知警告：CUDA 驱动偏旧（`found version 12020`），训练可正常完成；若报错可改用
+  `DLP_GPU_TYPE=H20-CUDA13.0-R4T2`。
