@@ -9,6 +9,7 @@ import gymnasium as gym
 import time
 import matplotlib.pyplot as plt
 import math
+import copy
 import h5py
 from gymnasium import spaces
 
@@ -41,7 +42,7 @@ SM_IDM_DELTA = 4.0  # []
 lanechange={'stay':0,'left':1,'right':-1}
 
 class Car:
-    def __init__(self, id, lane, pos, lane_pos, speed, length=5, width=2, lanes=3, is_ego=0):
+    def __init__(self, id, lane, pos, lane_pos, speed, length=5, width=2, lanes=3, is_ego=0, is_adversary=0):
         self.id = id
         self.lane = lane
         self.pos = pos
@@ -56,7 +57,8 @@ class Car:
         # 修复 2: 直接使用传入的 lane_pos，而不是强行计算
         self.lane_pos = lane_pos 
         
-        self.is_ego = is_ego  # 是否为强化学习控制的智能体车辆
+        self.is_ego = is_ego  # 是否为自车（被测试系统：观测视角 + 感知噪声注入对象）
+        self.is_adversary = is_adversary  # 是否为被 RL 控制的对抗背景车
         self.acceleration = 0  # 默认加速度为0
         self.leading_distance = -1  # 默认前车距离为-1
     def calculate_acceleration(self, leading_car):
@@ -310,6 +312,9 @@ class BasePhysicsEnv(gym.Env):
         
         self.cars = []
 
+        # 被 RL 控制的对抗背景车 id（背景车 id 从 1 开始；其余背景车与自车一样用 IDM + MOBIL）
+        self.adversary_id = 1
+
         # --- 关键修改 1: 动作空间对齐 ---
         # 纵向加速度: [-4, 2] 分 31 个值
         self.acc_bins = np.linspace(-4, 2, 31)
@@ -328,15 +333,40 @@ class BasePhysicsEnv(gym.Env):
         # Shape: (num_cars, 4) -> [x, y, vx, vy]
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(20,), dtype=np.float32)
 
+        # ===== 感知噪声模型：距离依赖的二次多项式高斯分布 =====
+        # mu(d)    = a0 + a1*d + a2*d^2
+        # sigma(d) = b0 + b1*d + b2*d^2
+
+        self.perception_noise_coeffs = {
+            'x': {
+                'mu':    (-0.00691,  -0.00013,  -4.64218e-07),
+                'sigma': ( 0.03711,   0.00511,  -5.68800e-05),
+            },
+            'y': {
+                'mu':    (-0.00571,   0.00039,  -4.90203e-08),
+                'sigma': ( 0.06703,   0.00593,  -7.43626e-05),
+            },
+            'vx': {
+                'mu':    (-0.00369,   0.00054,  -6.30793e-06),
+                'sigma': ( 0.06579,   0.00693,  -7.20104e-05),
+            },
+            'vy': {
+                'mu':    ( 0.00864,  -0.00323,   6.23654e-05),
+                'sigma': ( 0.31881,   0.00069,   5.11978e-06),
+            },
+        }
+
+        self.enable_perception_noise = True  # 消融实验时可设为 False
+
+
     def _generate_vehicles(self):
         self.cars = []
-        # 1. 生成 RL Agent (Ego/Adversary)
-        # 随机放在任意车道，速度随机
+        # 1. 生成自车（被测试系统，正常驾驶，由 IDM + MOBIL 控制，不做 RL）
         agent_lane = np.random.randint(1, self.lanes + 1)
         agent_pos = np.random.uniform(0, 100)
-        agent = Car(id=0, lane=agent_lane, pos=agent_pos, 
-                    lane_pos=(agent_lane-0.5)*self.lane_width, 
-                    speed=np.random.uniform(20, 25), is_ego=True)
+        agent = Car(id=0, lane=agent_lane, pos=agent_pos,
+                    lane_pos=(agent_lane-0.5)*self.lane_width,
+                    speed=np.random.uniform(20, 25), is_ego=True, is_adversary=False)
         self.cars.append(agent)
         
         # 2. 生成背景车 (避免重叠)
@@ -355,8 +385,9 @@ class BasePhysicsEnv(gym.Env):
                         break
                 
                 if valid:
-                    npc = Car(id=i, lane=lane, pos=pos, lane_pos=lane_pos, 
-                              speed=np.random.uniform(15, 30), is_ego=False)
+                    npc = Car(id=i, lane=lane, pos=pos, lane_pos=lane_pos,
+                              speed=np.random.uniform(15, 30), is_ego=False,
+                              is_adversary=(i == self.adversary_id))
                     self.cars.append(npc)
         
         # 按 ID 排序确保 state 顺序一致
@@ -374,157 +405,227 @@ class BasePhysicsEnv(gym.Env):
             grp = self.h5_file.create_group(grp_name)
             grp.create_dataset("trajectories", shape=(0, self.num_cars, 4), 
                                maxshape=(None, self.num_cars, 4), dtype=np.float32)
-            
-        self._generate_vehicles()
-        return self.get_state(),{}
+            grp.create_dataset("perception_data",
+                            shape=(0, self.num_cars, 13),
+                            maxshape=(None, self.num_cars, 13),
+                            dtype=np.float32)
 
-    def get_state(self):
+        self.last_perceived_states = np.zeros((self.num_cars, 13), dtype=np.float32)
+
+        self._generate_vehicles()
+        self._update_perception()  # 采样并缓存自车的带噪感知（供首步决策与日志）
+        init_state = self.get_true_state()  # RL（对抗车）观测使用真实状态
+        return init_state, {}
+
+    def _update_perception(self):
         """
-        [关键修复] 返回归一化的状态矩阵
-        将物理数值除以一个常数，使其落入 [-1, 1] 区间，防止神经网络梯度爆炸
+        采样一次自车对周围车辆的带噪感知（基于当前真实状态），
+        并把结果存到各车的 perceived_*/delta_*/dist_to_ego 字段，
+        同时构建 self.last_perceived_states（13 列：感知值/真实值/误差/距离）供日志使用。
+        只有自车有感知受限（对非自车加噪声）；自车对自身、以及背景车之间均为真实感知。
         """
-        state = []
-        agent = self.cars[0] 
-        base_x = agent.pos   
-        
-        # 定义归一化常数 (根据物理意义估算)
-        SCALE_X = 100.0      # 假设感知范围约 100米
-        SCALE_Y = 12.0       # 3车道 * 4米 = 12米
-        SCALE_V = 40.0       # 最大速度约 40m/s
-        
+        ego = self.cars[0]
+        perceived_log = []
+
         for car in self.cars:
-            # 1. 计算相对物理量
-            rel_x = car.pos - base_x 
-            '''
-            # 2. [核心] 执行归一化 (Normalization)
-            # 使用 tanh 或 simple division 都可以，这里用除法更线性
-            norm_x = rel_x / SCALE_X
-            norm_y = car.lane_pos / SCALE_Y
-            norm_vx = car.speed / SCALE_V
-            norm_vy = 0.0 
-            
-            # 3. 截断保护 (Clipping)
-            # 防止极其偶尔的极端值 (比如 rel_x = 500) 击穿网络
-            norm_x = np.clip(norm_x, -1.0, 1.0)
-            norm_y = np.clip(norm_y, 0.0, 1.0)
-            norm_vx = np.clip(norm_vx, 0.0, 1.0)
-            '''
-            norm_x = rel_x 
-            norm_y = car.lane_pos 
-            norm_vx = car.speed 
-            norm_vy = 0.0
-            state.append([norm_x, norm_y, norm_vx, norm_vy])
-            
+            if car.is_ego:
+                car.dist_to_ego = 0.0
+                car.delta_x = car.delta_y = car.delta_vx = car.delta_vy = 0.0
+                car.perceived_pos = car.pos
+                car.perceived_lane_pos = car.lane_pos
+                car.perceived_speed = car.speed
+                perceived_log.append([
+                    car.pos, car.lane_pos, car.speed, 0.0,   # 感知值
+                    car.pos, car.lane_pos, car.speed, 0.0,   # 真实值
+                    0.0, 0.0, 0.0, 0.0,                      # 误差 delta
+                    0.0                                       # 距离
+                ])
+            else:
+                dist = max(0.0, np.sqrt((car.pos - ego.pos) ** 2 +
+                                        (car.lane_pos - ego.lane_pos) ** 2))
+                car.dist_to_ego = dist
+                if self.enable_perception_noise:
+                    dx, dy, dvx, dvy = self._sample_perception_noise(dist)
+                else:
+                    dx = dy = dvx = dvy = 0.0
+                car.delta_x, car.delta_y, car.delta_vx, car.delta_vy = dx, dy, dvx, dvy
+                car.perceived_pos = car.pos + dx
+                car.perceived_lane_pos = car.lane_pos + dy
+                car.perceived_speed = max(0.0, car.speed + dvx)
+                perceived_log.append([
+                    car.perceived_pos, car.perceived_lane_pos, car.perceived_speed, dvy,  # 感知值
+                    car.pos,           car.lane_pos,           car.speed,           0.0,  # 真实值
+                    dx,                dy,                     dvx,                 dvy,  # 误差
+                    dist                                                                  # 距离
+                ])
+
+        self.last_perceived_states = np.array(perceived_log, dtype=np.float32)
+
+    def _ego_perceived_cars(self):
+        """
+        返回自车眼中的车辆列表：自车为真实自身，其余车辆用带噪感知的位置/速度。
+        供自车的 IDM / MOBIL 决策使用（浅拷贝，不修改真实车辆状态）。
+        """
+        perceived = []
+        for car in self.cars:
+            if car.is_ego:
+                perceived.append(car)
+            else:
+                c = copy.copy(car)
+                c.pos = car.perceived_pos
+                c.lane_pos = car.perceived_lane_pos
+                c.speed = car.perceived_speed
+                perceived.append(c)
+        return perceived
+
+    def get_true_state(self):
+        """
+        返回所有车辆的真实状态（无感知噪声），供对抗背景车的 RL 观测使用。
+        对抗车是真实物理车辆，没有感知受限问题；感知误差是自车的属性，
+        已通过奖励 r_perception 体现。
+        格式：[x, y, vx, vy] * num_cars（以自车为原点）。
+        """
+        base_x = self.cars[0].pos
+        state = []
+        for car in self.cars:
+            state.append([car.pos - base_x, car.lane_pos, car.speed, 0.0])
         return np.array(state, dtype=np.float32).flatten()
 
     def step(self, action):
         self.current_step += 1
-        
-        # --- 1. 动作映射 --
-        
+
         target_acc = np.clip(action[0], -4.0, 2.0)
         target_lat_disp = np.clip(action[1], -0.5, 0.5)
-        
-        # B. 执行阶段：更新所有车辆的物理位置
-        self._log_to_hdf5()
-        out_of_road = False # 记录智能体是否冲出道路
-        
+
+        out_of_road = False
+
+        # === 0. 采样一次自车的带噪感知（本步决策与日志共用同一次噪声）===
+        self._update_perception()
+
+        # === 1. 物理更新 ===
+        # 对抗背景车由 RL 控制（制造危险）；自车基于带噪感知做 IDM + MOBIL；
+        # 其他背景车基于真实感知做 IDM + MOBIL
         for car in self.cars:
-            if car.is_ego:
-                # === RL Agent (智能体) ===
-                # 智能体完全由 VQ-VAE 传来的 target_acc 和 target_lat_disp 控制
+            if car.is_adversary:
                 car.acceleration = target_acc
-                
-                # 纵向更新
                 car.pos += car.speed * time_step + 0.5 * target_acc * (time_step**2)
                 car.speed += target_acc * time_step
-                car.speed = max(0, car.speed) # 不倒车
-                
-                # 横向更新 (直接加上横向位移 dy)
+                car.speed = max(0, car.speed)
                 car.lane_pos += target_lat_disp
-                
-                # 更新所在车道 ID
                 car.lane = car.get_lane_from_position()
                 car.update_lane_offset()
-                
-                # 边界惩罚检测 (如果飞出 1~3 车道)
                 if car.lane_pos < 0 or car.lane_pos > self.lanes * lane_width:
                     out_of_road = True
-                    # 强行拉回边界防止崩溃
                     car.lane_pos = np.clip(car.lane_pos, 0, self.lanes * lane_width)
                     car.lane = car.get_lane_from_position()
-                    
+            elif car.is_ego:
+                perceived_cars = self._ego_perceived_cars()
+                car.acceleration = car.calculate_acceleration(car.find_leading_car(perceived_cars))
+                car.lane_change_direction = car.decide_lane_change(perceived_cars)
+                car.update_lane_position()
+                car.update_position(car.acceleration)
+                car.update_lane_offset()
             else:
-                # === Background Cars (背景车) ===
-                # 按照你复杂 Car 类的固有逻辑更新
-                car.acceleration=car.calculate_acceleration(car.find_leading_car(self.cars))
-                # 对抗背景车由智能体控制，使用强化学习模型来更新纵向加速度
+                car.acceleration = car.calculate_acceleration(car.find_leading_car(self.cars))
                 car.lane_change_direction = car.decide_lane_change(self.cars)
-                car.update_lane_position()            # 处理换道平滑横向移动
-                car.update_position(car.acceleration) # 处理纵向 IDM 移动
-                car.update_lane_offset()              # 更新横向偏移量
+                car.update_lane_position()
+                car.update_position(car.acceleration)
+                car.update_lane_offset()
 
-        # --- 3. 奖励计算 (最小 TTC & 碰撞) ---
-        reward = 0
-        done = False
+        # === 2. 生成当前步观测（RL 对抗车用真实状态）===
+        current_state = self.get_true_state()  # RL（对抗车）观测使用真实状态
+
+        # === 3. 记录数据 ===
+        self._log_to_hdf5()
+
+        # === 3.5 越界检测：直接终止并惩罚 ===
+        if out_of_road:
+            reward = -5.0
+            self.current_episode_reward += reward
+            info = {
+                'collision': False,
+                'min_ttc': 100.0,
+                'r_safety': 0.0,
+                'r_perception': 0.0,
+                'perception_delta': 0.0,
+                'episode_reward': self.current_episode_reward
+            }
+            grp_name = f"episode_{self.current_episode}"
+            if grp_name in self.h5_file:
+                grp = self.h5_file[grp_name]
+                grp.attrs['episode_reward'] = float(self.current_episode_reward)
+                grp.attrs['episode_length'] = int(self.current_step)
+                grp.attrs['collision'] = False
+            return current_state, reward, True, False, info
+
+        # === 4. 碰撞检测 & 真实TTC计算 ===
         collision = False
         min_ttc = 100.0
-        truncated = False
-        agent = self.cars[0] # 假设 ID 0 是 Agent
-        
-        # 遍历计算 Agent 与其他车的 TTC 和 碰撞
+        agent = self.cars[0]
+
         for npc in self.cars:
-            if npc.id == agent.id: continue
-            
-            # 碰撞检测 (AABB)
+            if npc.id == agent.id:
+                continue
             if self._check_collision(agent, npc):
                 collision = True
                 break
-            
-            # TTC 计算
             dist_x = npc.pos - agent.pos
             rel_v = agent.speed - npc.speed
-            
-            # 仅在同车道或横向距离很近时计算风险
             if abs(agent.lane_pos - npc.lane_pos) < 2.2:
-                # Agent 追尾前车
                 if dist_x > 0 and rel_v > 0:
-                    #ttc = (dist_x - 5) / rel_v
-                    #min_ttc = min(min_ttc, ttc)
-                    pass
-                # 后车追尾 Agent (被动风险)
-                elif dist_x < 0 and rel_v < 0:
-                    ttc = (abs(dist_x) - 5) / abs(rel_v)
+                    # 自车追上前方慢车（前向追尾风险）
+                    ttc = max((dist_x - agent.length), 0.0) / rel_v
                     min_ttc = min(min_ttc, ttc)
-        if min_ttc < 1e-5: min_ttc = 1e-5
-        # --- 奖励逻辑 ---
-        if collision: 
-            # 发生碰撞，回合结束
-            # 如果是生成高危场景（Attack），碰撞给大奖
-            
-            done = True
-            if min_ttc<10:
-                reward = 100.0 
-        else:
-            # 未碰撞，奖励与 TTC 负相关 (TTC 越小越危险，奖励越高)
-            # 使用 exp(-TTC) 将 TTC 映射到 (0, 1]
-            if min_ttc<3:
-                reward = np.exp(-min_ttc / 3.0) *100
-                done = True
-            else:
-                reward = -0.01 # 稍微惩罚无风险的游荡
-                if self.current_step >= self.max_steps:
-                    truncated = True                
+                elif dist_x < 0 and rel_v < 0:
+                    # 后车追上自车
+                    ttc = max((abs(dist_x) - agent.length), 0.0) / abs(rel_v)
+                    min_ttc = min(min_ttc, ttc)
 
-            
-            # 步数惩罚/最大步数截断
-        reward = np.clip(reward, -10.0, 100.0)    
+        if min_ttc < 1e-5:
+            min_ttc = 1e-5
+
+        # === 5. 安全临界场景奖励 r_safety（论文公式16）===
+        TTC_LOW      = 1.0
+        TTC_HIGH     = 4.0
+        alpha_safety = 5.0
+        beta_safety  = 1.0
+
+        done = False
+        truncated = False
+
+        if collision or min_ttc < TTC_LOW:
+            r_safety = beta_safety
+            done = True
+        elif TTC_LOW <= min_ttc <= TTC_HIGH:
+            r_safety = alpha_safety * (TTC_HIGH - min_ttc) / (TTC_HIGH - TTC_LOW)
+        else:
+            r_safety = 0.0
+            if self.current_step >= self.max_steps:
+                truncated = True
+
+        # === 6. 感知误差安全风险奖励 r_perception（论文公式17）===
+        alpha_perc = 10.0
+        beta_perc  = 20.0
+
+        r_perception, Delta = self._compute_perception_risk_reward(
+            n_samples=10,
+            n_steps=10,
+            alpha_perc=alpha_perc,
+            beta_perc=beta_perc
+        )
+
+        # === 7. 综合奖励（论文公式15）===
+        reward = r_safety + r_perception
+        reward = np.clip(reward, -10.0, 100.0)
 
         self.current_episode_reward += reward
-        
+
         info = {
             'collision': collision,
             'min_ttc': min_ttc,
+            'r_safety': r_safety,
+            'r_perception': r_perception,
+            'perception_delta': Delta,
             'episode_reward': self.current_episode_reward
         }
         terminated = done
@@ -536,8 +637,8 @@ class BasePhysicsEnv(gym.Env):
                 grp.attrs['episode_reward'] = float(self.current_episode_reward)
                 grp.attrs['episode_length'] = int(self.current_step)
                 grp.attrs['collision'] = bool(collision)
-                    
-        return self.get_state(), reward, terminated, truncated, info
+
+        return current_state, reward, terminated, truncated, info
 
 
     def _find_leader(self, car):
@@ -561,13 +662,162 @@ class BasePhysicsEnv(gym.Env):
         return dx < (car1.length/2 + car2.length/2) and dy < (car1.width/2 + car2.width/2)
 
     def _log_to_hdf5(self):
-        data = np.zeros((1, self.num_cars, 4), dtype=np.float32)
+        # --- 原有：记录真实轨迹 ---
+        true_data = np.zeros((1, self.num_cars, 4), dtype=np.float32)
         for i, car in enumerate(self.cars):
-            data[0, i, :] = [car.pos, car.lane_pos, car.speed, 0]
-            
+            true_data[0, i, :] = [car.pos, car.lane_pos, car.speed, 0]
+        
         dset = self.h5_file[f"episode_{self.current_episode}/trajectories"]
-        dset.resize(dset.shape[0]+1, axis=0)
-        dset[-1:] = data
+        dset.resize(dset.shape[0] + 1, axis=0)
+        dset[-1:] = true_data
+
+        # --- 新增：记录感知数据（含误差和距离）---
+        perc_data = self.last_perceived_states[np.newaxis, :, :]  # (1, num_cars, 13)
+        
+        dset_perc = self.h5_file[f"episode_{self.current_episode}/perception_data"]
+        dset_perc.resize(dset_perc.shape[0] + 1, axis=0)
+        dset_perc[-1:] = perc_data
+
+    def _poly2(self, coeffs, d):
+        """计算二次多项式: a0 + a1*d + a2*d^2，并裁剪sigma为非负"""
+        a0, a1, a2 = coeffs
+        return a0 + a1 * d + a2 * (d ** 2)
+
+    def _sample_perception_noise(self, d):
+        """
+        给定与背景车的距离d（米），采样四维感知噪声。
+        返回: (delta_x, delta_y, delta_vx, delta_vy)
+        """
+        d = max(0.0, d)  # 距离非负保护
+        noises = {}
+        for var, coeffs in self.perception_noise_coeffs.items():
+            mu    = self._poly2(coeffs['mu'],    d)
+            sigma = self._poly2(coeffs['sigma'], d)
+            sigma = max(sigma, 1e-6)  # sigma必须为正
+            noises[var] = np.random.normal(mu, sigma)
+        return noises['x'], noises['y'], noises['vx'], noises['vy']
+
+    def _simulate_future_ttc(self, observed_states, n_steps=10):
+        """
+        基于给定的观测状态（真实或带噪），使用代理模型前向仿真n步，返回最小TTC。
+        
+        observed_states: list of dict，每辆车的观测状态
+            格式: [{'pos': x, 'lane_pos': y, 'speed': vx, 'id': i, 'is_ego': bool}, ...]
+        n_steps: 前向仿真步数
+        返回: 该条轨迹的最小TTC（float）
+        """
+        # 深拷贝状态，避免修改真实环境
+        sim_cars = []
+        for s in observed_states:
+            c = Car(
+                id=s['id'],
+                lane=int(s['lane_pos'] // self.lane_width) + 1,
+                pos=s['pos'],
+                lane_pos=s['lane_pos'],
+                speed=max(0.0, s['speed']),
+                is_ego=s['is_ego']
+            )
+            sim_cars.append(c)
+
+        min_ttc = 100.0
+
+        for _ in range(n_steps):
+            # 更新每辆车（全部用IDM代理模型，包括ego）
+            for car in sim_cars:
+                leading = car.find_leading_car(sim_cars)
+                acc = car.calculate_acceleration(leading)
+                car.pos += car.speed * time_step + 0.5 * acc * (time_step ** 2)
+                car.speed = max(0.0, car.speed + acc * time_step)
+
+            # 计算ego与其他车的TTC
+            ego = sim_cars[0]
+            for npc in sim_cars[1:]:
+                dist_x = npc.pos - ego.pos
+                rel_v = ego.speed - npc.speed
+                if abs(ego.lane_pos - npc.lane_pos) < 2.2:
+                    if dist_x > 0 and rel_v > 0:
+                        ttc = max((dist_x - ego.length), 0.0) / rel_v
+                        min_ttc = min(min_ttc, ttc)
+                    elif dist_x < 0 and rel_v < 0:
+                        ttc = max((abs(dist_x) - ego.length), 0.0) / abs(rel_v)
+                        min_ttc = min(min_ttc, ttc)
+
+        return min_ttc
+
+    def _compute_perception_risk_reward(self, n_samples=10, n_steps=10,
+                                        alpha_perc=1.0, beta_perc=2.0):
+        """
+        计算感知误差安全风险奖励（论文公式17）。
+        
+        核心逻辑：
+        1. 用真实观测前向仿真 n_samples 条轨迹 → 真实风险分布 E[R_true]
+        2. 用带噪观测前向仿真 n_samples 条轨迹 → 感知风险分布 E[R_obs]  
+        3. 计算期望风险差 Delta = E[R_obs] - E[R_true]
+        4. 奖励 = alpha * |Delta| + beta * max(0, -Delta)
+        
+        返回: (perception_reward, Delta)
+        """
+        agent = self.cars[0]
+
+        # --- 构建真实观测状态 ---
+        true_states = []
+        for car in self.cars:
+            true_states.append({
+                'id': car.id,
+                'pos': car.pos,
+                'lane_pos': car.lane_pos,
+                'speed': car.speed,
+                'is_ego': car.is_ego
+            })
+
+        # --- 多次采样带噪观测状态 ---
+        def build_noisy_states():
+            noisy = []
+            for car in self.cars:
+                if car.is_ego:
+                    noisy.append({
+                        'id': car.id,
+                        'pos': car.pos,
+                        'lane_pos': car.lane_pos,
+                        'speed': car.speed,
+                        'is_ego': True
+                    })
+                else:
+                    dist = np.sqrt((car.pos - agent.pos) ** 2 +
+                                (car.lane_pos - agent.lane_pos) ** 2)
+                    if self.enable_perception_noise:
+                        dx, dy, dvx, _ = self._sample_perception_noise(dist)
+                    else:
+                        dx, dy, dvx = 0.0, 0.0, 0.0
+                    noisy.append({
+                        'id': car.id,
+                        'pos': car.pos + dx,
+                        'lane_pos': car.lane_pos + dy,
+                        'speed': max(0.0, car.speed + dvx),
+                        'is_ego': False
+                    })
+            return noisy
+
+        # --- 采样风险分布 ---
+        # 注意：TTC越小风险越高，这里用 1/TTC 作为风险度量，TTC=100时风险≈0
+        def ttc_to_risk(ttc):
+            return 1.0 / max(ttc, 0.1)   # 风险值，TTC越小风险越大
+
+        # 真实风险只需仿真一次（确定性，无随机）
+        true_ttc = self._simulate_future_ttc(true_states, n_steps)
+        E_true = ttc_to_risk(true_ttc)
+
+        # 带噪风险 Monte Carlo 采样 n_samples 次
+        obs_risks = []
+        for _ in range(n_samples):
+            noisy_states = build_noisy_states()
+            obs_ttc = self._simulate_future_ttc(noisy_states, n_steps)
+            obs_risks.append(ttc_to_risk(obs_ttc))
+        E_obs = np.mean(obs_risks)
+
+        Delta = E_obs - E_true
+        perception_reward = alpha_perc * abs(Delta) + beta_perc * max(0.0, -Delta)
+        return perception_reward, Delta
 
 
 
@@ -597,8 +847,9 @@ model = PPO(
     env=vec_env,
     
     verbose=1,
-    device='cpu'
-)
+    device='cpu',
+    tensorboard_log="/root/autodl-tmp/OpenPCDet/ppo_logs/"
+)\
 
 model.learn(total_timesteps=200000)
 model.save(record_path +"ppo_200k")
