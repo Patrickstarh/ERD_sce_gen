@@ -205,8 +205,12 @@ python tools/test.py \
 | `sce_gen_ori.py` | 原始版本（保留作备份，未修改） |
 | `sce_gen.py` | 当前 CPU 版本（本文档多数改动在此落地） |
 | `sce_gen_gpu.py` | GPU 训练版本（`sce_gen.py` 的 argparse/device 包装） |
+| `sce_gen_parallel.py` | 真并行版本（SubprocVecEnv 多进程并行采样） |
+| `sce_gen_en.py` | `sce_gen.py` 的英文注释版（新文件） |
+| `sce_gen_gpu_en.py` | `sce_gen_gpu.py` 的英文注释版（新文件） |
 | `submit_sce_gen.py` | 提交 DLP 集群的脚本 |
-| `analyze_results.ipynb` | 多 seed 结果合并分析 notebook |
+| `analyze_results.ipynb` | 多 seed 结果合并分析 notebook（标题/标签已英文） |
+| `analyze_results_en.ipynb` | 上述 notebook 的全英文版（新文件） |
 
 ## 9. 车辆角色定义（关键）
 
@@ -293,8 +297,8 @@ if abs(agent.lane_pos - npc.lane_pos) < 2.2:
 - PPO 传入 `device=device, seed=args.seed, tensorboard_log=record_path + "tensorboard"`
 - `model.learn(total_timesteps=args.timesteps)`；`model.save(record_path + f"ppo_{args.timesteps // 1000}k")`
 
-> 注：`sce_gen.py`（CPU 版）仍保留旧的 tensorboard 路径
-> `"/root/autodl-tmp/OpenPCDet/ppo_logs/"`，如需本地 CPU 训练请自行改为本地路径。
+> 注：`sce_gen.py`（CPU 版）原先硬编码 tensorboard 路径 `"/root/autodl-tmp/OpenPCDet/ppo_logs/"`（autodl 专用）。
+> 现已修复为 `tensorboard_log=record_path + "tensorboard"`，与本地 `./ppo_logs_{timestamp}/` 目录一致，不再依赖 autodl 路径。
 
 ## 15. 提交脚本 `submit_sce_gen.py`
 
@@ -329,3 +333,54 @@ if abs(agent.lane_pos - npc.lane_pos) < 2.2:
 - 感知风险低估：真实危险时刻中 54.17% 自车低估了危险（感知 TTC > 真实 TTC）
 - 已知警告：CUDA 驱动偏旧（`found version 12020`），训练可正常完成；若报错可改用
   `DLP_GPU_TYPE=H20-CUDA13.0-R4T2`。
+
+## 18. 英文注释版（`sce_gen_en.py` / `sce_gen_gpu_en.py`）
+
+为英文展示/交流用途，将 `sce_gen.py` 与 `sce_gen_gpu.py` 全文翻译为英文注释版：
+
+- `sce_gen_en.py`：`sce_gen.py` 的英文版（类名、函数名、逻辑不变，仅注释/docstring/print 英文）。
+- `sce_gen_gpu_en.py`：`sce_gen_gpu.py` 的英文版（由 `sce_gen_en.py` 经同样的 argparse/device 变换生成）。
+
+两版功能与中文版**完全等价**，仅语言不同；`sce_gen_en.py` 同样已修复 autodl 路径问题（`tensorboard_log=record_path + "tensorboard"`）。
+
+## 19. 真并行版本 `sce_gen_parallel.py`
+
+基于 `sce_gen_gpu.py` 改造，用 `SubprocVecEnv` 实现**多进程并行采样**（区别于 15 节的「多卡独立并行」）：
+
+- `DummyVecEnv` → `SubprocVecEnv`（多进程，每个 worker 独立 GIL，真正并行 CPU 采样）。
+- 新增 `--num-envs` 参数，默认 `min(os.cpu_count() or 1, 16)`。
+- `record_path = f"./ppo_logs_parallel_{timestamp}/"`。
+- 每个 worker 独立 HDF5 文件 + 独立随机种子：
+
+```python
+def make_env(rank, base_seed, record_path, timestamp):
+    def _init():
+        np.random.seed(base_seed + rank)   # 每个 worker 显式设置独立种子
+        filename = record_path + f"vae-ppo_vehicle_trajectories_worker{rank}_{timestamp}.h5"
+        return BasePhysicsEnv(output_file=filename)
+    return _init
+
+vec_env = SubprocVecEnv(
+    [make_env(i, args.seed, record_path, timestamp) for i in range(args.num_envs)]
+)
+```
+
+**与之前版本的一致性**：
+
+- 环境类 `BasePhysicsEnv`、奖励函数、感知噪声模型、HDF5 schema **完全不变** → 产出的危险场景分布与之前**统计一致**。
+- 但**非逐位一致**：
+  1. 每个 worker 用 `np.random.seed(base_seed + rank)`，采样出的具体轨迹与单环境版不同（同分布、不同样本）。
+  2. `total_timesteps=200000` 是**所有环境加总**，每个 worker 只跑 `200000 / N` 步，单个 worker 文件 episode 数约为之前的 `1/N`（全部 worker 合计大致持平）。
+
+**注意事项**：
+
+- 每个 worker 进程约 300–500 MB 内存；worker 数不要超过物理 CPU 核数。
+- DLP 共享网络盘上多进程同时写 HDF5 可能有磁盘 IO 瓶颈，需实测 FPS 调 `--num-envs`。
+- 若需严格复现某次结果（固定 seed 出同一批数据），把 `--num-envs` 设为 1 即可。
+
+## 20. 分析 notebook 英文版
+
+- `analyze_results.ipynb`：中文本体、**英文图标题/标签**（供英文展示）。
+- `analyze_results_en.ipynb`：全英文版（markdown/code/print/图标题/标签全部英文，无 CJK）。
+
+并行版产物目录为 `ppo_logs_parallel*`，复用时将 notebook 头部 `H5_GLOB` 改为对应目录即可。
