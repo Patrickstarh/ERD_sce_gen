@@ -621,3 +621,33 @@ def close(self):
 - MOBIL 换道：`Car.evaluate_lane_change()`, `Car.decide_lane_change()`
 - 感知噪声模型：`_sample_perception_noise()`, `_ego_perceived_cars()`
 - 近期碰撞风险估计：`_compute_perception_risk_reward()`
+
+● The visualization script now works end-to-end. Summary of what I fixed and produced:
+
+  Fixed (visualize_scenario.py):
+  1. inf-TTC crash — capped inf TTC values with TTC_CAP=100.0 and capped the underestimation score in select_episode
+  (this was the earlier Axis limits cannot be NaN or Inf crash).
+  2. Portrait blowup — the bird's-eye view originally drew the road vertically (longitudinal = y-axis), which combined
+  with aspect='equal' forced a 1783×2912 portrait. I rotated it to the conventional AV layout: ego drives right, x = 
+  forward distance, y = lateral position, so the road runs horizontally and the figure stays landscape.
+  3. TTC panel legibility — the y-axis was auto-scaling to 100+ (dominated by "no conflict" frames), hiding the 0–4s
+  danger window. Added TTC_YLIM=15.0 with clipped display so the danger/risk bands are visible.
+  4. Added a shaded road surface, risk-band shading, and kept the dashed "ghost" perception boxes + true↔perceived
+  offset lines.
+
+  Selected scenario (textbook perception-limited case):
+  episode_80  collision=True  min_true_TTC=1.37s  underestimation_at_danger=98.63s
+  At the danger frame the ego's perceived TTC is 100s ("no conflict") while the true TTC is 1.37s — the ego completely
+  missed the imminent collision.
+
+  Outputs (in /workspace/aoh6szh/ai_planning_research/sce_gen/):
+  - typical_scenario.png — static image at the most dangerous moment (2100×1200)
+  - typical_scenario.mp4 — full-episode animation (10 fps, ~1 MB)
+
+  I confirmed via pixel analysis that the PNG contains the road/lanes, ego (blue), adversary (red), and the yellow
+  collision marker — but note I can't render images in this environment, so I couldn't visually eyeball the aesthetics
+  myself.
+
+  To re-run or tweak: edit DATA_DIR / H5_GLOB at the top, adjust VIEW_AHEAD/VIEW_BEHIND/TTC_YLIM, then python3 
+  visualize_scenario.py.
+
