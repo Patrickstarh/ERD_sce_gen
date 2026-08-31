@@ -384,3 +384,240 @@ vec_env = SubprocVecEnv(
 - `analyze_results_en.ipynb`：全英文版（markdown/code/print/图标题/标签全部英文，无 CJK）。
 
 并行版产物目录为 `ppo_logs_parallel*`，复用时将 notebook 头部 `H5_GLOB` 改为对应目录即可。
+
+
+# sce_gen_gpu_en.py 改动说明
+
+## 概述
+
+本文档记录了对 `sce_gen_gpu_en.py` 的改动，使其成为一个**考虑感知受限的自动驾驶测试场景生成系统**。核心目标是：用 PPO 控制对抗背景车，对自车产生对抗行为，生成**真实且多样、具有实际价值的 near-miss 场景**，而非碰撞场景。
+
+---
+
+## 核心架构设计
+
+### 场景生成逻辑
+
+1. **对抗背景车（RL 控制）**：由 PPO 策略直接控制纵向加速度和横向偏移，目的是制造危险但可避免的场景
+2. **自车（Ego）**：使用 IDM + MOBIL 控制，**感知受限**——感知到的周围车辆位置/速度含有距离相关的高斯噪声
+3. **其他背景车**：使用 IDM + MOBIL 控制，**感知完全**（看到真实状态）
+4. **碰撞判据**：使用真实物理状态（无噪声）
+
+```
+真值物理引擎 → 自车感知加噪 → 自车基于噪声决策 → 真值判碰撞/奖励
+```
+
+---
+
+## 奖励函数设计（关键改动）
+
+### 问题：原始设计的缺陷
+
+**原有问题**：r_safety 随 TTC 减小而单调递增 → 策略最优解是"悬停在 TTC≈1 但绝不撞"，或直接碰撞，**不会生成可持续的 near-miss 场景**。
+
+### 新设计：平台型 near-miss 奖励
+
+```python
+# Near-miss target band
+TTC_NEAR_LOW  = 0.8   # 低于此值太接近碰撞 → 惩罚
+TTC_NEAR_HIGH = 2.5   # 高于此值不足够危险 → 无奖励
+TTC_SAFE      = 5.0   # 超出此值完全安全 → 无奖励
+R_NEAR_MISS   = 5.0   # 目标带内的奖励
+```
+
+奖励曲线：
+
+```
+TTC:   0.0   0.4   0.8   1.5   2.5   3.0   4.0   5.0   100
+r:    -5.0   0.0  +5.0  +5.0  +5.0  +4.0  +2.0   0.0   0.0
+                  └──── 目标带 ────┘
+```
+
+### 碰撞惩罚（不可薅羊毛）
+
+- `COLLISION_PENALTY = -50.0`
+- 在 clip 之外施加 → 即使提前积累了高额奖励，碰撞仍会导致总收益为负
+- 与 `R_NEAR_MISS = 5.0` 对比：需要 10 步持续 near-miss 才能抵消一次碰撞
+
+### 生存奖励（鼓励持续施压）
+
+- `SURVIVAL_BONUS = 25.0`
+- 只有跑完整个 episode 且不碰撞才发放
+- 按 `带内时间占比` 加权 → "持续施压但始终不接触"成为最优策略
+
+### 自然性惩罚（保证真实性）
+
+防止对抗车产生 bang-bang 急刹或疯狂画龙等物理合法但不现实的行为：
+
+```python
+r_natural = -[w_jerk * (jerk/10)^2 + w_lat * (lat_change/2.5)^2 + w_harsh * max(0, -acc-3)^2]
+
+w_jerk = 0.30   # 纵向加加速度
+w_lat  = 0.50   # 横向摆动
+w_harsh = 0.20  # 持续急刹（<-3 m/s²）
+```
+
+标定示例：
+
+| 行为 | 惩罚/步 |
+|------|---------|
+| 平稳巡航 | -0.02 |
+| 激进但真实的切入 | -0.17 |
+| 随机 bang-bang + 画龙 | -4.9 |
+
+---
+
+## 感知噪声模型改进
+
+### 问题：原始二次拟合在远距离失效
+
+原始 sigma(d) = a0 + a1*d + a2*d²（a2<0）在 d≈40-50m 达峰后回落，在 d≈90-105m 过零 clamp 到 1e-6 → **远车反而观测得完美**，物理上反了。
+
+### 解决：sigma 饱和在峰值处
+
+```python
+self.sigma_saturation_dist[var] = -b1 / (2*b2)  # 二次函数驻点
+d_sigma = min(d, self.sigma_saturation_dist[var])
+```
+
+验证输出（以 x 轴为例）：
+```
+sigma_x @ d=20/45/90/200 : [0.1166, 0.1519, 0.1519, 0.1519]
+```
+
+---
+
+## 观测空间改进
+
+### 问题：横向速度 vy 恒为 0
+
+`get_true_state()` 第 4 维硬编码为 0.0，即使对抗车正在横移。
+
+### 解决：新增 `Car.lat_speed`
+
+```python
+# Car.__init__ 新增
+self.lat_speed = 0.0
+
+# step() 中每步更新
+lane_pos_before = car.lane_pos
+# ... physics update ...
+car.lat_speed = (car.lane_pos - lane_pos_before) / time_step
+
+# get_true_state() 使用
+state.append([car.pos - base_x, car.lane_pos, car.speed, car.lat_speed])
+```
+
+---
+
+## 对抗车生成位置优化
+
+### 问题：大量 episode 中对抗车生成在 150m 外，根本够不着自车
+
+### 解决：对抗车初始位置约束
+
+```python
+if i == self.adversary_id:
+    offset = np.random.uniform(10.0, 50.0) * np.random.choice([-1.0, 1.0])
+    pos = ego.pos + offset
+else:
+    pos = np.random.uniform(0, 200)
+```
+
+---
+
+## 稳定性与调试改进
+
+### HDF5 文件处理
+
+```python
+# 每 100 步 flush
+if self.current_step % 100 == 0:
+    self.h5_file.flush()
+
+# 新增 close() 方法
+def close(self):
+    if getattr(self, 'h5_file', None) is not None:
+        try:
+            self.h5_file.flush()
+            self.h5_file.close()
+        finally:
+            self.h5_file = None
+```
+
+### 代码清理
+
+- 删除无用的 `decide_lane_change_ego()` 方法（含拼写错误 `self.lane_change_progress`）
+
+---
+
+## 场景可筛选性
+
+每个 episode 的 HDF5 attrs 现在包含：
+
+```python
+{
+    'collision': bool,
+    'episode_length': int,
+    'episode_reward': float,
+    'min_ttc': float,
+    'near_miss_steps': int,      # 新增
+    'is_near_miss': bool         # 新增
+}
+```
+
+`info` 字典新增字段：
+
+- `r_natural`：自然性惩罚
+- `near_miss`：本步是否在目标带内
+
+---
+
+## 参数配置表
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `TTC_NEAR_LOW` | 0.8 | near-miss 下限 |
+| `TTC_NEAR_HIGH` | 2.5 | near-miss 上限 |
+| `TTC_SAFE` | 5.0 | 完全安全阈值 |
+| `R_NEAR_MISS` | 5.0 | 目标带内奖励 |
+| `COLLISION_PENALTY` | -50.0 | 碰撞惩罚 |
+| `SURVIVAL_BONUS` | 25.0 | 生存奖励 |
+| `w_jerk` | 0.30 | jerk 惩罚系数 |
+| `w_lat` | 0.50 | 横向摆动惩罚系数 |
+| `w_harsh` | 0.20 | 急刹惩罚系数 |
+| `alpha_safety` | 5.0 | 安全奖励系数（保留备用） |
+| `beta_safety` | 1.0 | 安全奖励系数（保留备用） |
+| `alpha_perc` | 2.0 | 感知风险奖励系数 |
+| `beta_perc` | 4.0 | 感知风险奖励系数 |
+
+---
+
+## 文件修改概览
+
+| 位置 | 修改内容 |
+|------|----------|
+| `__init__` | 新增 12 行参数；新增 `sigma_saturation_dist` 初始化 |
+| `_poly2`, `_sample_perception_noise` | 修改 noise sampling 使用饱和距离 |
+| `_near_miss_reward` | 新增方法（35 行） |
+| `_naturalness_penalty` | 新增方法（20 行） |
+| `reset` | 新增 episode 初始状态初始化 |
+| `step` | 修改 reward 计算逻辑；新增 per-step near-miss tracking；新增碰撞后惩罚；新增生存奖励 |
+| `close` | 新增方法 |
+| Car class | 新增 `lat_speed` 属性 |
+| 训练脚本末尾 | 新增 `raw_env.close()` |
+
+---
+
+## 已知保留项（按需求）
+
+- **感知噪声时间相关性（AR 模型）**：未实现，按需求保留白噪声
+
+---
+
+## 参考资料
+
+- IDM 模型：`Car.calculate_acceleration()`
+- MOBIL 换道：`Car.evaluate_lane_change()`, `Car.decide_lane_change()`
+- 感知噪声模型：`_sample_perception_noise()`, `_ego_perceived_cars()`
+- 近期碰撞风险估计：`_compute_perception_risk_reward()`
