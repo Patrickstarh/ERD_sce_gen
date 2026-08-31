@@ -20,6 +20,7 @@ Assumes the fixed (aligned) HDF5 data, where perception_data true columns
 
 import os
 import glob
+import argparse
 import numpy as np
 import h5py
 import matplotlib
@@ -83,28 +84,51 @@ def min_ttc_vectorized(ego, others):
 
 
 # ===================== data loading =====================
+def _load_episode_dict(path, key, g):
+    """Build the episode dict expected by draw_frame from one h5 group.
+
+    `g` is an already-open h5 group for `key` (e.g. 'episode_42'). Returns None
+    if the trajectory is empty.
+    """
+    traj = g['trajectories'][:]            # (T, 5, 4) true state
+    perc = g['perception_data'][:, :, 0:4]  # (T, 5, 4) ego's noisy view
+    if traj.shape[0] == 0:
+        return None
+    ttc_true = min_ttc_vectorized(traj[:, 0, :], traj[:, 1:, :])
+    ttc_perc = min_ttc_vectorized(perc[:, 0, :], perc[:, 1:, :])
+    ttc_true = np.where(np.isinf(ttc_true), TTC_CAP, ttc_true)
+    ttc_perc = np.where(np.isinf(ttc_perc), TTC_CAP, ttc_perc)
+    return dict(
+        path=path, key=key, traj=traj, perc=perc,
+        ttc_true=ttc_true, ttc_perc=ttc_perc,
+        collision=bool(g.attrs.get('collision', False)),
+        reward=float(g.attrs.get('episode_reward', 0.0)),
+    )
+
+
 def collect_episodes(files):
     """Return a list of episode dicts with trajectory + perception + TTC data."""
     eps = []
     for path in files:
         with h5py.File(path, 'r') as f:
             for k in f.keys():
-                g = f[k]
-                traj = g['trajectories'][:]            # (T, 5, 4) true state
-                perc = g['perception_data'][:, :, 0:4]  # (T, 5, 4) ego's noisy view
-                if traj.shape[0] == 0:
-                    continue
-                ttc_true = min_ttc_vectorized(traj[:, 0, :], traj[:, 1:, :])
-                ttc_perc = min_ttc_vectorized(perc[:, 0, :], perc[:, 1:, :])
-                ttc_true = np.where(np.isinf(ttc_true), TTC_CAP, ttc_true)
-                ttc_perc = np.where(np.isinf(ttc_perc), TTC_CAP, ttc_perc)
-                eps.append(dict(
-                    path=path, key=k, traj=traj, perc=perc,
-                    ttc_true=ttc_true, ttc_perc=ttc_perc,
-                    collision=bool(g.attrs.get('collision', False)),
-                    reward=float(g.attrs.get('episode_reward', 0.0)),
-                ))
+                e = _load_episode_dict(path, k, f[k])
+                if e is not None:
+                    eps.append(e)
     return eps
+
+
+def load_one_episode(path, episode):
+    """Load a single episode by (h5 path, episode id). Returns the episode dict."""
+    key = f"episode_{int(episode)}"
+    with h5py.File(path, 'r') as f:
+        if key not in f:
+            raise SystemExit(f"Group {key} not found in {path}; "
+                             f"available: {list(f.keys())[:10]} ...")
+        e = _load_episode_dict(path, key, f[key])
+    if e is None:
+        raise SystemExit(f"Empty trajectory for {key} in {path}")
+    return e
 
 
 def select_episode(eps):
@@ -230,20 +254,64 @@ def draw_frame(ax_main, ax_ttc, e, idx, collision):
 
 
 # ===================== main =====================
+def parse_args():
+    p = argparse.ArgumentParser(
+        description=("Render a perception-limited dangerous scenario as a static "
+                     "PNG (most dangerous frame) and an MP4/GIF animation of the "
+                     "whole episode. Two modes: (a) auto-select the most typical "
+                     "dangerous episode across all H5 files matching H5_GLOB "
+                     "(default), or (b) render a specific episode given --path and "
+                     "--episode."))
+    p.add_argument('--path', type=str, default=None,
+                   help="h5 file path. If set together with --episode, skip auto "
+                        "selection and render this specific episode.")
+    p.add_argument('--episode', type=int, default=None,
+                   help="episode id (the integer in 'episode_<id>'). Required with "
+                        "--path for specific-episode mode.")
+    p.add_argument('--out-image', type=str, default=OUT_IMAGE,
+                   help=f"output PNG path (default: {OUT_IMAGE})")
+    p.add_argument('--out-video', type=str, default=OUT_VIDEO,
+                   help=f"output MP4 path (default: {OUT_VIDEO})")
+    p.add_argument('--list-episodes', action='store_true',
+                   help="list all episode ids in the given --path and exit")
+    return p.parse_args()
+
+
 def main():
-    files = sorted(glob.glob(H5_GLOB))
-    if not files:
-        raise SystemExit(f"No HDF5 files found for: {H5_GLOB}")
-    print(f"Found {len(files)} h5 files")
+    args = parse_args()
 
-    eps = collect_episodes(files)
-    print(f"Loaded {len(eps)} episodes")
-    if not eps:
-        raise SystemExit("No episodes with data")
+    # ---- list mode ----
+    if args.list_episodes:
+        if not args.path:
+            raise SystemExit("--list-episodes requires --path")
+        with h5py.File(args.path, 'r') as f:
+            keys = sorted(f.keys(), key=lambda k: int(k.split('_')[1]))
+            print(f"{len(keys)} episodes in {args.path}")
+            print(keys[:20], "..." if len(keys) > 20 else "")
+        return
 
-    e, danger_i = select_episode(eps)
+    # ---- pick the episode to render ----
+    if args.path:
+        if args.episode is None:
+            raise SystemExit("--path requires --episode (use --list-episodes to see ids)")
+        e = load_one_episode(args.path, args.episode)
+        print(f"Loaded {e['key']} from {args.path}")
+    else:
+        files = sorted(glob.glob(H5_GLOB))
+        if not files:
+            raise SystemExit(f"No HDF5 files found for: {H5_GLOB}")
+        print(f"Found {len(files)} h5 files")
+        eps = collect_episodes(files)
+        print(f"Loaded {len(eps)} episodes")
+        if not eps:
+            raise SystemExit("No episodes with data")
+        e, _ = select_episode(eps)
+
+    danger_i = int(np.argmin(e['ttc_true']))
     T = e['traj'].shape[0]
     collision = e['collision']
+    out_image = args.out_image
+    out_video = args.out_video
 
     layout_kw = dict(figsize=(14, 8), gridspec_kw={'height_ratios': [2.2, 1]})
 
@@ -253,9 +321,9 @@ def main():
     fig_img.suptitle("Perception-limited dangerous scenario (most dangerous moment)",
                      fontsize=13)
     fig_img.subplots_adjust(top=0.92, hspace=0.38)
-    fig_img.savefig(OUT_IMAGE, dpi=150)
+    fig_img.savefig(out_image, dpi=150)
     plt.close(fig_img)
-    print(f"Saved image: {OUT_IMAGE}")
+    print(f"Saved image: {out_image}")
 
     # ---- video of the whole episode ----
     fig, (ax_m2, ax_t2) = plt.subplots(2, 1, **layout_kw)
@@ -267,10 +335,10 @@ def main():
     anim = animation.FuncAnimation(fig, update, frames=T, interval=1000 / FPS, blit=False)
 
     try:
-        anim.save(OUT_VIDEO, writer=animation.FFMpegWriter(fps=FPS, bitrate=2500))
-        print(f"Saved video: {OUT_VIDEO}")
+        anim.save(out_video, writer=animation.FFMpegWriter(fps=FPS, bitrate=2500))
+        print(f"Saved video: {out_video}")
     except Exception as ex:  # fallback to GIF if ffmpeg unavailable
-        gif_path = OUT_VIDEO.rsplit('.', 1)[0] + '.gif'
+        gif_path = out_video.rsplit('.', 1)[0] + '.gif'
         anim.save(gif_path, writer=animation.PillowWriter(fps=FPS))
         print(f"FFmpeg unavailable ({ex}); saved GIF: {gif_path}")
     plt.close(fig)

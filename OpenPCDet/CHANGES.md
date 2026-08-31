@@ -651,3 +651,120 @@ def close(self):
   To re-run or tweak: edit DATA_DIR / H5_GLOB at the top, adjust VIEW_AHEAD/VIEW_BEHIND/TTC_YLIM, then python3 
   visualize_scenario.py.
 
+# 场景可视化流程
+
+从一批 PPO 生成的 h5 结果中，挑选并渲染"感知受限的典型危险场景"。整个流程分两步：先在 notebook 里挑出 top-10 候选，再用 `visualize_scenario.py` 渲染静态图 + 视频。
+
+---
+
+## 前置条件
+
+- h5 数据目录（默认配置在 `visualize_scenario.py` 顶部和 notebook 第一个单元格）：
+  ```
+  DATA_DIR = "/workspace/asw-shared/dlp/training_tasks/aoh6szh/n260827-174817-scegen-ppo"
+  H5_GLOB  = "$DATA_DIR/ppo_logs_gpu*/vae-ppo_vehicle_trajectories_*.h5"
+  ```
+- Python 3 + 依赖：`numpy h5py matplotlib`（动画需要 `ffmpeg` 或 `pillow`）
+
+---
+
+## 第一步：在 notebook 中挑选候选场景
+
+打开 `analyze_results_en.ipynb`，依次运行单元格直到 "Pick top-10 representative perception-limited dangerous scenarios" 这一节。流程如下：
+
+1. **统计单元格**：从所有 h5 中读取每条 episode 的元数据（collision / min_ttc / reward / length），构造 `meta` DataFrame。共约 1 万条 episode。
+2. **评分排名单元格**：从候选池（`collision=True` 或 `min_ttc<4s`）里逐条重读 `trajectories` + `perception_data`，按下方评分公式排序，取 top-10 存到 `top10`。
+
+评分公式（在原 `visualize_scenario.py` 单帧评分基础上改进）：
+
+| 信号 | 公式 | 含义 |
+|---|---|---|
+| 危险严重度 | `max(0, TTC_LOW - min_ttc)` | TTC 越低越危险（≤1s 封顶） |
+| 危险帧低估 | `0.5 * min(under_at_danger, 10)` | argmin(ttc_true) 那一帧的感知低估 |
+| 持续低估 | `0.5 * min(mean_under_window, 3)` | 整个危险窗口（TTC<4s）的平均低估，避免选到撞车那帧才误判的特例 |
+| 危险持续时长 | `0.05 * danger_window_s` | 奖励持续逼近而非单帧抖动 |
+
+3. **逐个查看单元格**：设 `i = 0..9` 重跑，每次调用 `plot_episode` 画出该 episode 的纵向 + 横向位置曲线，肉眼判断哪个最典型、视觉最清晰。
+4. **命令生成单元格**：基于当前 `i` 打印对应的 `visualize_scenario.py` 命令行，复制到终端执行。
+
+---
+
+## 第二步：用 visualize_scenario.py 渲染
+
+### 自动模式（默认）
+
+不传 `--path`，脚本 glob 所有 h5、用 `select_episode` 自动挑一个最典型的危险场景，输出到默认文件名：
+
+```bash
+python3 sce_gen/visualize_scenario.py
+# -> typical_scenario.png + typical_scenario.mp4
+```
+
+### 指定 episode 模式（推荐，配合 notebook 使用）
+
+传 `--path` + `--episode` 跳过自动选择，直接渲染你在 notebook 里挑中的那一条：
+
+```bash
+python3 sce_gen/visualize_scenario.py \
+    --path /workspace/asw-shared/.../ppo_logs_gpu0_.../vae-ppo_vehicle_trajectories_....h5 \
+    --episode 42 \
+    --out-image scenario_rank0.png \
+    --out-video scenario_rank0.mp4
+```
+
+参数说明：
+
+| 参数 | 说明 |
+|---|---|
+| `--path PATH` | h5 文件路径。与 `--episode` 同时使用即跳过自动选择 |
+| `--episode N` | episode id（`episode_<N>` 中的整数），必须与 `--path` 同传 |
+| `--out-image PATH` | 输出 PNG 路径（默认 `typical_scenario.png`） |
+| `--out-video PATH` | 输出 MP4 路径（默认 `typical_scenario.mp4`）；ffmpeg 不可用时自动回落到同名 `.gif` |
+| `--list-episodes` | 列出 `--path` 内所有 episode id 后退出，用于核对 id |
+
+### 典型工作流
+
+```bash
+# 1) 在 notebook 里跑完 top10 单元格，肉眼挑出 i=3 最典型
+
+# 2) 复制 notebook 单元格打印出的命令行：
+python3 sce_gen/visualize_scenario.py \
+    --path /workspace/asw-shared/.../vae-ppo_vehicle_trajectories_....h5 \
+    --episode 87 \
+    --out-image scenario_rank3.png --out-video scenario_rank3.mp4
+
+# 3) 检查输出
+ls -lh scenario_rank3.png scenario_rank3.mp4
+```
+
+---
+
+## 输出说明
+
+- **静态 PNG**：渲染最危险那一帧（`argmin(ttc_true)`）的鸟瞰图 + TTC 子图，标注 `t / true TTC / perceived TTC / DANGER|RISK|SAFE` 状态
+- **视频 MP4/GIF**：整段 episode 的鸟瞰图动画，10 fps
+- 鸟瞰图：自车蓝色实心、对抗车红色实心、背景车灰色；其他车辆的真实位置画实心矩形，自车对它们的**噪声感知**画成同色虚线 ghost 框，并用细线连接到真实位置 —— 直观展示"感知低估"
+- TTC 子图：黑色实线 = 真实 TTC，红色虚线 = 感知 TTC，红/橙阴影标出 `<1s` 和 `1~4s` 危险带
+
+---
+
+## 常见问题
+
+**Q: 渲染视频失败、报 ffmpeg 错误？**
+脚本会自动回落到 `.gif`（用 Pillow）。如果连 Pillow 也没装，`pip install pillow` 即可。
+
+**Q: 想批量渲染 top10 全部？**
+在 notebook 里循环调用：
+```python
+import subprocess
+for i, r in top10.iterrows():
+    subprocess.run([
+        "python3", "sce_gen/visualize_scenario.py",
+        "--path", r["path"], "--episode", str(r["episode"]),
+        "--out-image", f"scenario_rank{i}.png",
+        "--out-video", f"scenario_rank{i}.mp4",
+    ], check=True)
+```
+
+**Q: 自动模式选出来的和 notebook top10 第一名不一样？**
+是的，两者评分公式不同（自动模式是单帧评分，notebook 是窗口评分）。以 notebook 的 top10 为准，因为它更贴近"持续感知低估"这一主题。
